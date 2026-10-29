@@ -53,7 +53,7 @@ jobs:
           cat > control << 'ZEOF_CTL'
           Package: com.juana.datespeedbar
           Name: DateSpeedBar
-          Version: 1.0.0
+          Version: 1.1.0
           Architecture: iphoneos-arm64
           Description: Fecha (dd/mm/aaaa) y velocidad de internet en la barra de estado, alrededor del reloj. Solo SpringBoard, en todas las apps.
           Maintainer: Juana
@@ -64,7 +64,7 @@ jobs:
           cat > DateSpeedBar.plist << 'ZEOF_FILT'
           {
               Filter = {
-                  Bundles = ( "com.apple.springboard" );
+                  Bundles = ( "com.apple.UIKit" );
               };
           }
           ZEOF_FILT
@@ -203,6 +203,9 @@ jobs:
 
           static CFStringRef const kDomainCF = CFSTR("com.juana.datespeedbar");
           static const char *kPrefChanged = "com.juana.datespeedbar/preferencesChanged";
+          static const char *kBarStyle    = "com.juana.datespeedbar/barstyle";
+
+          static BOOL gIsSpringBoard = NO;
 
           // --- Preferencias (valores por defecto) ---
           static BOOL      gEnabled    = YES;
@@ -215,6 +218,11 @@ jobs:
           static CGFloat   gFontSize   = 9.0;   // "rueda de tamano"
           static CGFloat   gGap        = 18.0;  // separacion vertical (hueco para el reloj)
           static NSInteger gColor      = 0;     // 0 blanco, 1 negro, 2 naranja
+          static BOOL      gAutoColor  = YES;   // igualar el color del reloj (claro/oscuro) de cada app
+
+          // Estilo de barra reportado por la app en primer plano: 1 = texto blanco
+          // (fondo oscuro), 3 = texto negro (fondo claro). Por defecto blanco.
+          static long long gBarStyle   = 1;
 
           // --- UI: ventana flotante (escritorio / apps) ---
           static UIWindow *gWindow;
@@ -232,6 +240,10 @@ jobs:
           static double    gLastDown = 0.0, gLastUp = 0.0;
 
           static UIColor *textColor(void) {
+              if (gAutoColor) {
+                  // Igual que el reloj: blanco si el estilo es "light content", negro si no.
+                  return (gBarStyle == 1) ? UIColor.whiteColor : UIColor.blackColor;
+              }
               switch (gColor) {
                   case 1:  return UIColor.blackColor;
                   case 2:  return [UIColor colorWithRed:0.969 green:0.576 blue:0.102 alpha:1.0];
@@ -282,6 +294,7 @@ jobs:
               gFontSize   = prefNum(CFSTR("FontSize"), 9);
               gGap        = prefNum(CFSTR("Gap"), 18);
               gColor      = (NSInteger)prefNum(CFSTR("Color"), 0);
+              gAutoColor  = prefBool(CFSTR("AutoColor"), YES);
               if (gFontSize < 6) gFontSize = 6;
               if (gGap < 0) gGap = 0;
           }
@@ -504,6 +517,59 @@ jobs:
               updateLockState();
           }
 
+          #pragma mark - Observador del estilo de barra (lado app)
+
+          // Se ejecuta en TODAS las apps (incluida SpringBoard). NO dibuja nada: solo lee
+          // el estilo de la barra de estado de la app y lo publica para que el overlay de
+          // SpringBoard pinte la fecha/velocidad del mismo color que el reloj.
+          static int      gStyleToken = -1;
+          static long long gLastReported = -999;
+
+          static void reportStyle(void) {
+              @try {
+                  UIApplication *app = [UIApplication sharedApplication];
+                  if (!app) return;
+                  long long style = 0;
+                  @try {
+          #pragma clang diagnostic push
+          #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                      style = (long long)[app statusBarStyle];
+          #pragma clang diagnostic pop
+                  } @catch (__unused id e) { return; }
+                  // "default" (0): resolver segun claro/oscuro del sistema.
+                  if (style == 0) {
+                      UIUserInterfaceStyle ui = UIUserInterfaceStyleLight;
+                      @try { ui = UITraitCollection.currentTraitCollection.userInterfaceStyle; } @catch (__unused id e) {}
+                      style = (ui == UIUserInterfaceStyleDark) ? 1 : 3;  // blanco : negro
+                  }
+                  if (style == gLastReported) return;
+                  gLastReported = style;
+                  if (gStyleToken != -1) {
+                      notify_set_state(gStyleToken, (uint64_t)style);
+                      notify_post(kBarStyle);
+                  }
+              } @catch (__unused id e) {}
+          }
+
+          %hook UIViewController
+          - (void)setNeedsStatusBarAppearanceUpdate {
+              %orig;
+              dispatch_async(dispatch_get_main_queue(), ^{ reportStyle(); });
+          }
+          %end
+
+          static void setupStyleObserver(void) {
+              // Token para publicar el estado del estilo.
+              notify_register_check(kBarStyle, &gStyleToken);
+              // Reportar al activarse la app y periodicamente por si algun caso se escapa.
+              [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                  object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+                      reportStyle();
+                  }];
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{ reportStyle(); });
+          }
+
           #pragma mark - Hook del CoverSheet (pantalla de bloqueo)
 
           @interface CSCoverSheetViewController : UIViewController
@@ -534,6 +600,14 @@ jobs:
 
           %ctor {
               @autoreleasepool {
+                  gIsSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"];
+
+                  // Observador de estilo: en TODOS los procesos (apps + SpringBoard).
+                  setupStyleObserver();
+
+                  // El overlay (dibujo) y lo demas: SOLO en SpringBoard.
+                  if (!gIsSpringBoard) return;
+
                   loadPrefs();
                   gLocked = NO;   // no tocar SBLockScreenManager aqui (demasiado pronto)
 
@@ -552,6 +626,14 @@ jobs:
                       uint64_t state = 0;
                       notify_get_state(t, &state);
                       setScreenOff(state != 0);
+                  });
+
+                  // Recibir el estilo de barra que publican las apps y recolorear.
+                  int styleListen;
+                  notify_register_dispatch(kBarStyle, &styleListen, dispatch_get_main_queue(), ^(int t) {
+                      uint64_t v = 0;
+                      notify_get_state(t, &v);
+                      if (v == 1 || v == 3) { gBarStyle = (long long)v; if (gAutoColor) refreshAll(); }
                   });
 
                   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -832,13 +914,30 @@ jobs:
           			<string>PSGroupCell</string>
           			<key>label</key>
           			<string>Color</string>
+          			<key>footerText</key>
+          			<string>Con "Color automatico" la fecha y la velocidad cambian a negro o blanco igual que el reloj, segun el fondo de cada app. Si lo apagas, usa el color fijo de abajo.</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Color automatico (como el reloj)</string>
+          			<key>key</key>
+          			<string>AutoColor</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
           		</dict>
 
           		<dict>
           			<key>cell</key>
           			<string>PSSegmentCell</string>
           			<key>label</key>
-          			<string>Color del texto</string>
+          			<string>Color fijo</string>
           			<key>key</key>
           			<string>Color</string>
           			<key>default</key>
