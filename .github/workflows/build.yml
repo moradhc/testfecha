@@ -1,0 +1,904 @@
+name: Build DateSpeedBar (roothide arm64e)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Instalar ldid
+        run: brew install ldid
+
+      - name: Instalar Theos (roothide)
+        run: |
+          git clone --quiet --recursive https://github.com/roothide/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Instalar SDK de iOS (con frameworks privados)
+        run: |
+          cd "$HOME/theos/sdks"
+          curl -LO https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz
+          tar -xf iPhoneOS16.5.sdk.tar.xz
+          rm iPhoneOS16.5.sdk.tar.xz
+
+      - name: Generar las fuentes
+        run: |
+          set -e
+          cat > Makefile << 'ZEOF_MK'
+          # Esquema roothide (arm64e). Exporta THEOS apuntando a tu Theos de roothide
+          # si no es el por defecto (p. ej. export THEOS=~/theos-roothide).
+          export THEOS_PACKAGE_SCHEME = roothide
+
+          TARGET := iphone:clang:latest:15.0
+          ARCHS = arm64e arm64
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = DateSpeedBar
+
+          DateSpeedBar_FILES = Tweak.x SpeedMonitor.m
+          DateSpeedBar_CFLAGS = -fobjc-arc
+          DateSpeedBar_FRAMEWORKS = UIKit Foundation CoreGraphics
+
+          include $(THEOS)/makefiles/tweak.mk
+
+          SUBPROJECTS += dsbprefs
+          include $(THEOS)/makefiles/aggregate.mk
+
+          after-install::
+          	install.exec "sbreload || killall -9 SpringBoard"
+          ZEOF_MK
+          cat > control << 'ZEOF_CTL'
+          Package: com.juana.datespeedbar
+          Name: DateSpeedBar
+          Version: 1.0.0
+          Architecture: iphoneos-arm64
+          Description: Fecha (dd/mm/aaaa) y velocidad de internet en la barra de estado, alrededor del reloj. Solo SpringBoard, en todas las apps.
+          Maintainer: Juana
+          Author: Juana
+          Section: Tweaks
+          Depends: mobilesubstrate, preferenceloader, firmware (>= 15.0)
+          ZEOF_CTL
+          cat > DateSpeedBar.plist << 'ZEOF_FILT'
+          {
+              Filter = {
+                  Bundles = ( "com.apple.springboard" );
+              };
+          }
+          ZEOF_FILT
+          cat > SpeedMonitor.h << 'ZEOF_SMH'
+          #import <Foundation/Foundation.h>
+
+          NS_ASSUME_NONNULL_BEGIN
+
+          // Mide la velocidad de red (bytes/seg) leyendo los contadores de las interfaces
+          // (WiFi en0 + datos moviles pdp_ip0) y calculando el delta cada segundo.
+          @interface SpeedMonitor : NSObject
+
+          @property (class, nonatomic, readonly) SpeedMonitor *shared;
+
+          // Ultimas velocidades en bytes/seg (0 si aun no hay dato).
+          @property (nonatomic, assign, readonly) double downBytesPerSec;
+          @property (nonatomic, assign, readonly) double upBytesPerSec;
+
+          // Se llama en el hilo principal cada vez que hay una medida nueva.
+          @property (nonatomic, copy, nullable) void (^onUpdate)(double down, double up);
+
+          - (void)start;   // arranca el muestreo (1 vez/seg)
+          - (void)stop;    // lo detiene
+
+          @end
+
+          NS_ASSUME_NONNULL_END
+          ZEOF_SMH
+          cat > SpeedMonitor.m << 'ZEOF_SMM'
+          #import "SpeedMonitor.h"
+          #import <ifaddrs.h>
+          #import <net/if.h>
+          #import <net/if_dl.h>
+
+          // Suma los bytes recibidos/enviados de las interfaces de red "reales"
+          // (WiFi: en*, datos moviles: pdp_ip*). Ignora loopback y las virtuales.
+          static void readCounters(uint64_t *inBytes, uint64_t *outBytes) {
+              uint64_t in = 0, out = 0;
+              struct ifaddrs *addrs = NULL;
+              if (getifaddrs(&addrs) == 0) {
+                  for (struct ifaddrs *ptr = addrs; ptr; ptr = ptr->ifa_next) {
+                      if (!ptr->ifa_addr || ptr->ifa_addr->sa_family != AF_LINK) continue;
+                      const char *name = ptr->ifa_name;
+                      if (!name) continue;
+                      BOOL isWifi = (strncmp(name, "en", 2) == 0);
+                      BOOL isWwan = (strncmp(name, "pdp_ip", 6) == 0);
+                      if (!isWifi && !isWwan) continue;
+                      struct if_data *d = (struct if_data *)ptr->ifa_data;
+                      if (!d) continue;
+                      in  += d->ifi_ibytes;
+                      out += d->ifi_obytes;
+                  }
+                  freeifaddrs(addrs);
+              }
+              if (inBytes)  *inBytes  = in;
+              if (outBytes) *outBytes = out;
+          }
+
+          @interface SpeedMonitor ()
+          @property (nonatomic, strong) NSTimer *timer;
+          @property (nonatomic, assign) uint64_t lastIn;
+          @property (nonatomic, assign) uint64_t lastOut;
+          @property (nonatomic, assign) NSTimeInterval lastTime;
+          @property (nonatomic, assign) double downBytesPerSec;
+          @property (nonatomic, assign) double upBytesPerSec;
+          @end
+
+          @implementation SpeedMonitor
+
+          + (SpeedMonitor *)shared {
+              static SpeedMonitor *instance = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{ instance = [[SpeedMonitor alloc] init]; });
+              return instance;
+          }
+
+          - (void)start {
+              [self stop];
+              // Primera lectura de referencia (sin emitir velocidad todavia).
+              readCounters(&_lastIn, &_lastOut);
+              _lastTime = [NSDate timeIntervalSinceReferenceDate];
+              self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                            target:self
+                                                          selector:@selector(tick)
+                                                          userInfo:nil
+                                                           repeats:YES];
+          }
+
+          - (void)stop {
+              [self.timer invalidate];
+              self.timer = nil;
+          }
+
+          - (void)tick {
+              uint64_t in = 0, out = 0;
+              readCounters(&in, &out);
+              NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+              NSTimeInterval dt = now - self.lastTime;
+              if (dt <= 0) dt = 1.0;
+
+              // Proteccion ante reinicios de contador (si baja, tratamos como 0).
+              uint64_t din  = (in  >= self.lastIn)  ? (in  - self.lastIn)  : 0;
+              uint64_t dout = (out >= self.lastOut) ? (out - self.lastOut) : 0;
+
+              self.downBytesPerSec = (double)din  / dt;
+              self.upBytesPerSec   = (double)dout / dt;
+              self.lastIn = in;
+              self.lastOut = out;
+              self.lastTime = now;
+
+              double down = self.downBytesPerSec;
+              double up   = self.upBytesPerSec;
+              if (self.onUpdate) {
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      if (self.onUpdate) self.onUpdate(down, up);
+                  });
+              }
+          }
+
+          @end
+          ZEOF_SMM
+          cat > Tweak.x << 'ZEOF_TWK'
+          #import <UIKit/UIKit.h>
+          #import <notify.h>
+          #import <objc/runtime.h>
+          #import "SpeedMonitor.h"
+
+          // ============================================================================
+          // DateSpeedBar — fecha (dd/mm/aaaa) y velocidad de internet en la barra de
+          // estado, alrededor del reloj del sistema. Se inyecta SOLO en SpringBoard (un
+          // unico proceso): ventana flotante para escritorio/apps + vista en el bloqueo.
+          // Bloque de dos lineas (fecha arriba, velocidad abajo) con separacion ajustable
+          // para dejar el reloj del sistema en medio. Sin segundo reloj. Pausa total con
+          // la pantalla apagada (bateria). Arquitectura probada: sin safe mode.
+          // ============================================================================
+
+          static CFStringRef const kDomainCF = CFSTR("com.juana.datespeedbar");
+          static const char *kPrefChanged = "com.juana.datespeedbar/preferencesChanged";
+
+          // --- Preferencias (valores por defecto) ---
+          static BOOL      gEnabled    = YES;
+          static BOOL      gShowDate   = YES;
+          static BOOL      gShowSpeed  = YES;
+          static BOOL      gShowUpload = YES;   // mostrar subida ademas de bajada
+          static NSInteger gAlignment  = 0;     // 0 izq, 1 centro, 2 der
+          static CGFloat   gOffsetX    = 0.0;
+          static CGFloat   gOffsetY    = 0.0;
+          static CGFloat   gFontSize   = 9.0;   // "rueda de tamano"
+          static CGFloat   gGap        = 18.0;  // separacion vertical (hueco para el reloj)
+          static NSInteger gColor      = 0;     // 0 blanco, 1 negro, 2 naranja
+
+          // --- UI: ventana flotante (escritorio / apps) ---
+          static UIWindow *gWindow;
+          static UIView   *gContainer;
+          static UILabel  *gDateLabel;
+          static UILabel  *gSpeedLabel;
+
+          // --- UI: dentro del bloqueo (CoverSheet) ---
+          static UIView   *gLSContainer;
+          static UILabel  *gLSDateLabel;
+          static UILabel  *gLSSpeedLabel;
+
+          static BOOL      gLocked = NO;
+          static BOOL      gScreenOff = NO;
+          static double    gLastDown = 0.0, gLastUp = 0.0;
+
+          static UIColor *textColor(void) {
+              switch (gColor) {
+                  case 1:  return UIColor.blackColor;
+                  case 2:  return [UIColor colorWithRed:0.969 green:0.576 blue:0.102 alpha:1.0];
+                  default: return UIColor.whiteColor;
+              }
+          }
+
+          #pragma mark - Estado de bloqueo
+
+          @interface SBLockScreenManager : NSObject
+          + (instancetype)sharedInstance;
+          - (BOOL)isUILocked;
+          @end
+
+          static BOOL deviceLocked(void) {
+              Class cls = objc_getClass("SBLockScreenManager");
+              if (!cls) return NO;
+              id mgr = [cls sharedInstance];
+              if (![mgr respondsToSelector:@selector(isUILocked)]) return NO;
+              return [(SBLockScreenManager *)mgr isUILocked];
+          }
+
+          #pragma mark - Preferencias
+
+          static BOOL prefBool(CFStringRef key, BOOL def) {
+              Boolean ok = false;
+              Boolean v = CFPreferencesGetAppBooleanValue(key, kDomainCF, &ok);
+              return ok ? (BOOL)v : def;
+          }
+          static double prefNum(CFStringRef key, double def) {
+              CFPropertyListRef v = CFPreferencesCopyAppValue(key, kDomainCF);
+              if (!v) return def;
+              double r = def;
+              if (CFGetTypeID(v) == CFNumberGetTypeID())      r = [(__bridge NSNumber *)v doubleValue];
+              else if (CFGetTypeID(v) == CFStringGetTypeID()) r = [(__bridge NSString *)v doubleValue];
+              CFRelease(v);
+              return r;
+          }
+          static void loadPrefs(void) {
+              CFPreferencesAppSynchronize(kDomainCF);
+              gEnabled    = prefBool(CFSTR("Enabled"), YES);
+              gShowDate   = prefBool(CFSTR("ShowDate"), YES);
+              gShowSpeed  = prefBool(CFSTR("ShowSpeed"), YES);
+              gShowUpload = prefBool(CFSTR("ShowUpload"), YES);
+              gAlignment  = (NSInteger)prefNum(CFSTR("Alignment"), 0);
+              gOffsetX    = prefNum(CFSTR("OffsetX"), 0);
+              gOffsetY    = prefNum(CFSTR("OffsetY"), 0);
+              gFontSize   = prefNum(CFSTR("FontSize"), 9);
+              gGap        = prefNum(CFSTR("Gap"), 18);
+              gColor      = (NSInteger)prefNum(CFSTR("Color"), 0);
+              if (gFontSize < 6) gFontSize = 6;
+              if (gGap < 0) gGap = 0;
+          }
+
+          #pragma mark - Formato
+
+          static NSString *dateString(void) {
+              static NSDateFormatter *f = nil;
+              if (!f) {
+                  f = [[NSDateFormatter alloc] init];
+                  f.dateFormat = @"dd/MM/yyyy";
+                  f.locale = [NSLocale localeWithLocaleIdentifier:@"es_ES"];
+              }
+              return [f stringFromDate:[NSDate date]];
+          }
+
+          static NSString *shortSpeed(double bytesPerSec) {
+              double mb = bytesPerSec / 1048576.0;
+              double kb = bytesPerSec / 1024.0;
+              if (mb >= 1.0) return [NSString stringWithFormat:@"%.1fM", mb];
+              return [NSString stringWithFormat:@"%.0fK", kb];
+          }
+
+          static NSString *speedString(double down, double up) {
+              if (gShowUpload)
+                  return [NSString stringWithFormat:@"↓%@ ↑%@", shortSpeed(down), shortSpeed(up)];
+              return [NSString stringWithFormat:@"↓%@", shortSpeed(down)];
+          }
+
+          #pragma mark - Escena activa
+
+          static UIWindowScene *activeScene(void) {
+              UIWindowScene *fallback = nil;
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if (![s isKindOfClass:UIWindowScene.class]) continue;
+                  UIWindowScene *ws = (UIWindowScene *)s;
+                  if (ws.activationState == UISceneActivationStateForegroundActive) return ws;
+                  if (!fallback) fallback = ws;
+              }
+              return fallback;
+          }
+
+          #pragma mark - Layout comun del bloque (fecha arriba, velocidad abajo)
+
+          // Coloca las dos etiquetas dentro de 'container' y devuelve el tamano total.
+          static CGSize layoutBlock(UIView *container, UILabel *dateL, UILabel *speedL) {
+              UIFont *font = [UIFont monospacedDigitSystemFontOfSize:gFontSize weight:UIFontWeightSemibold];
+              dateL.font = font;  speedL.font = font;
+              dateL.textColor = textColor();  speedL.textColor = textColor();
+
+              dateL.text  = gShowDate  ? dateString() : @"";
+              speedL.text = gShowSpeed ? speedString(gLastDown, gLastUp) : @"";
+              dateL.hidden  = !gShowDate;
+              speedL.hidden = !gShowSpeed;
+
+              [dateL sizeToFit];  [speedL sizeToFit];
+              CGFloat dW = gShowDate  ? ceil(dateL.bounds.size.width)  : 0;
+              CGFloat dH = gShowDate  ? ceil(dateL.bounds.size.height) : 0;
+              CGFloat sW = gShowSpeed ? ceil(speedL.bounds.size.width) : 0;
+              CGFloat sH = gShowSpeed ? ceil(speedL.bounds.size.height): 0;
+
+              CGFloat totalW = MAX(dW, sW);
+              CGFloat gap = (gShowDate && gShowSpeed) ? gGap : 0;
+              CGFloat totalH = dH + gap + sH;
+              if (totalW < 1 || totalH < 1) return CGSizeZero;
+
+              // Centradas horizontalmente dentro del bloque; fecha arriba, velocidad abajo.
+              dateL.frame  = CGRectMake((totalW - dW) / 2.0, 0, dW, dH);
+              speedL.frame = CGRectMake((totalW - sW) / 2.0, totalH - sH, sW, sH);
+              return CGSizeMake(totalW, totalH);
+          }
+
+          #pragma mark - Ventana flotante (escritorio / apps)
+
+          static void ensureWindow(void) {
+              if (gWindow) return;
+              UIWindowScene *scene = activeScene();
+              if (!scene) return;
+
+              gWindow = [[UIWindow alloc] initWithWindowScene:scene];
+              gWindow.windowLevel = 100000.0;
+              gWindow.backgroundColor = UIColor.clearColor;
+              gWindow.userInteractionEnabled = NO;
+              gWindow.frame = CGRectZero;   // tamano del contenido (no pantalla completa)
+              gWindow.hidden = NO;
+
+              gContainer = [[UIView alloc] init];
+              gContainer.userInteractionEnabled = NO;
+              [gWindow addSubview:gContainer];
+
+              gDateLabel = [[UILabel alloc] init];
+              gSpeedLabel = [[UILabel alloc] init];
+              [gContainer addSubview:gDateLabel];
+              [gContainer addSubview:gSpeedLabel];
+          }
+
+          static void layoutTicker(void) {
+              if (!gWindow || !gContainer) return;
+              if (gLocked || !gEnabled) { gWindow.hidden = YES; return; }
+
+              UIWindowScene *scene = gWindow.windowScene;
+              if (!scene) return;
+              CGRect sbFrame = scene.statusBarManager.statusBarFrame;
+              CGFloat screenW = scene.coordinateSpace.bounds.size.width;
+              CGFloat sbTop = sbFrame.origin.y;
+              CGFloat sbH   = (sbFrame.size.height > 1.0 ? sbFrame.size.height : 54.0);
+
+              CGSize sz = layoutBlock(gContainer, gDateLabel, gSpeedLabel);
+              if (sz.width < 1 || sz.height < 1) { gWindow.hidden = YES; return; }
+
+              CGFloat y = sbTop + (sbH - sz.height) / 2.0 + gOffsetY;
+              CGFloat x;
+              if (gAlignment == 0)      x = 10.0 + gOffsetX;
+              else if (gAlignment == 2) x = screenW - sz.width - 10.0 + gOffsetX;
+              else                      x = (screenW - sz.width) / 2.0 + gOffsetX;
+
+              gWindow.hidden = NO;
+              gWindow.frame = CGRectMake(x, y, sz.width, sz.height);
+              gContainer.frame = CGRectMake(0, 0, sz.width, sz.height);
+          }
+
+          #pragma mark - Vista dentro del bloqueo (CoverSheet)
+
+          static void layoutLockScreenTicker(void) {
+              if (!gLSContainer || !gLSContainer.superview) return;
+              UIView *host = gLSContainer.superview;
+              gLSContainer.hidden = !(gEnabled && gLocked);
+              if (gLSContainer.hidden) return;
+
+              CGFloat screenW = host.bounds.size.width;
+              CGFloat ti = host.safeAreaInsets.top; if (ti < 1.0) ti = 54.0;
+
+              CGSize sz = layoutBlock(gLSContainer, gLSDateLabel, gLSSpeedLabel);
+              if (sz.width < 1 || sz.height < 1) { gLSContainer.hidden = YES; return; }
+
+              CGFloat y = (ti - sz.height) / 2.0 + gOffsetY;
+              CGFloat x;
+              if (gAlignment == 0)      x = 10.0 + gOffsetX;
+              else if (gAlignment == 2) x = screenW - sz.width - 10.0 + gOffsetX;
+              else                      x = (screenW - sz.width) / 2.0 + gOffsetX;
+              gLSContainer.frame = CGRectMake(x, y, sz.width, sz.height);
+          }
+
+          static void ensureLockScreenTicker(UIView *host) {
+              if (!host) return;
+              if (!gLSContainer || gLSContainer.superview != host) {
+                  gLSContainer = [[UIView alloc] init];
+                  gLSContainer.userInteractionEnabled = NO;
+                  gLSDateLabel = [[UILabel alloc] init];
+                  gLSSpeedLabel = [[UILabel alloc] init];
+                  [gLSContainer addSubview:gLSDateLabel];
+                  [gLSContainer addSubview:gLSSpeedLabel];
+                  [host addSubview:gLSContainer];
+              }
+              [host bringSubviewToFront:gLSContainer];
+              layoutLockScreenTicker();
+          }
+
+          #pragma mark - Refresco
+
+          static void refreshAll(void) {
+              layoutTicker();
+              layoutLockScreenTicker();
+          }
+
+          static void onSpeed(double down, double up) {
+              gLastDown = down;
+              gLastUp = up;
+              refreshAll();
+          }
+
+          #pragma mark - Arranque / parada
+
+          static void startTicker(void) {
+              if (!gEnabled) {
+                  if (gWindow) gWindow.hidden = YES;
+                  if (gLSContainer) gLSContainer.hidden = YES;
+                  [[SpeedMonitor shared] stop];
+                  return;
+              }
+              ensureWindow();
+              if (gWindow) gWindow.hidden = NO;
+
+              SpeedMonitor *sm = [SpeedMonitor shared];
+              sm.onUpdate = ^(double d, double u) { onSpeed(d, u); };
+              [sm start];
+              refreshAll();
+          }
+
+          static void stopTicker(void) {
+              [[SpeedMonitor shared] stop];
+              if (gWindow) gWindow.hidden = YES;
+              if (gLSContainer) gLSContainer.hidden = YES;
+          }
+
+          #pragma mark - Estado de bloqueo / pantalla
+
+          static void updateLockState(void) {
+              gLocked = deviceLocked();
+              refreshAll();
+          }
+
+          static void setScreenOff(BOOL off) {
+              if (off == gScreenOff) return;
+              gScreenOff = off;
+              if (off) {
+                  [[SpeedMonitor shared] stop];
+              } else if (gEnabled) {
+                  [[SpeedMonitor shared] start];
+                  refreshAll();
+              }
+          }
+
+          #pragma mark - Recarga de preferencias
+
+          static void prefsChanged(void) {
+              loadPrefs();
+              if (!gEnabled) { stopTicker(); return; }
+              startTicker();
+              updateLockState();
+          }
+
+          #pragma mark - Hook del CoverSheet (pantalla de bloqueo)
+
+          @interface CSCoverSheetViewController : UIViewController
+          @end
+
+          %hook CSCoverSheetViewController
+          - (void)viewDidAppear:(BOOL)animated {
+              %orig;
+              gLocked = YES;
+              if (gEnabled) ensureLockScreenTicker(self.view);
+              layoutTicker();
+          }
+          - (void)viewWillDisappear:(BOOL)animated {
+              %orig;
+              gLocked = NO;
+              if (gLSContainer) gLSContainer.hidden = YES;
+              layoutTicker();
+          }
+          - (void)viewDidLayoutSubviews {
+              %orig;
+              if (gEnabled && gLSContainer && gLSContainer.superview == self.view) {
+                  layoutLockScreenTicker();
+              }
+          }
+          %end
+
+          #pragma mark - ctor
+
+          %ctor {
+              @autoreleasepool {
+                  loadPrefs();
+                  gLocked = NO;   // no tocar SBLockScreenManager aqui (demasiado pronto)
+
+                  int token;
+                  notify_register_dispatch(kPrefChanged, &token, dispatch_get_main_queue(), ^(int t) {
+                      prefsChanged();
+                  });
+
+                  int lockToken;
+                  notify_register_dispatch("com.apple.springboard.lockstate", &lockToken,
+                                           dispatch_get_main_queue(), ^(int t) { updateLockState(); });
+
+                  int blankToken;
+                  notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &blankToken,
+                                           dispatch_get_main_queue(), ^(int t) {
+                      uint64_t state = 0;
+                      notify_get_state(t, &state);
+                      setScreenOff(state != 0);
+                  });
+
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                      startTicker();
+                      updateLockState();
+                  });
+              }
+          }
+          ZEOF_TWK
+          mkdir -p dsbprefs
+          cat > dsbprefs/Makefile << 'ZEOF_PMK'
+          include $(THEOS)/makefiles/common.mk
+
+          BUNDLE_NAME = DSBPrefs
+
+          DSBPrefs_FILES = DSBPrefs.m
+          DSBPrefs_INSTALL_PATH = /Library/PreferenceBundles
+          DSBPrefs_FRAMEWORKS = UIKit
+          DSBPrefs_PRIVATE_FRAMEWORKS = Preferences
+          DSBPrefs_CFLAGS = -fobjc-arc
+
+          include $(THEOS)/makefiles/bundle.mk
+
+          internal-stage::
+          	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceBundles/DSBPrefs.bundle$(ECHO_END)
+          	$(ECHO_NOTHING)cp -R Resources/* $(THEOS_STAGING_DIR)/Library/PreferenceBundles/DSBPrefs.bundle/$(ECHO_END)
+          ZEOF_PMK
+          mkdir -p dsbprefs
+          cat > dsbprefs/DSBPrefs.m << 'ZEOF_PBM'
+          #import <Preferences/PSListController.h>
+          #import <Preferences/PSSpecifier.h>
+
+          @interface DSBPrefsRootListController : PSListController
+          @end
+
+          @implementation DSBPrefsRootListController
+
+          - (NSArray *)specifiers {
+              if (!_specifiers) {
+                  _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+              }
+              return _specifiers;
+          }
+
+          @end
+          ZEOF_PBM
+          mkdir -p dsbprefs/Resources
+          cat > dsbprefs/Resources/Info.plist << 'ZEOF_INF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key>
+          	<string>English</string>
+          	<key>CFBundleExecutable</key>
+          	<string>DSBPrefs</string>
+          	<key>CFBundleIdentifier</key>
+          	<string>com.juana.datespeedbar.prefs</string>
+          	<key>CFBundleInfoDictionaryVersion</key>
+          	<string>6.0</string>
+          	<key>CFBundleName</key>
+          	<string>DSBPrefs</string>
+          	<key>CFBundlePackageType</key>
+          	<string>BNDL</string>
+          	<key>CFBundleShortVersionString</key>
+          	<string>1.0.0</string>
+          	<key>CFBundleVersion</key>
+          	<string>1.0.0</string>
+          	<key>NSPrincipalClass</key>
+          	<string>DSBPrefsRootListController</string>
+          </dict>
+          </plist>
+          ZEOF_INF
+          mkdir -p dsbprefs/Resources
+          cat > dsbprefs/Resources/Root.plist << 'ZEOF_ROOT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>title</key>
+          	<string>DateSpeedBar</string>
+          	<key>items</key>
+          	<array>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>DateSpeedBar</string>
+          			<key>footerText</key>
+          			<string>Fecha (dd/mm/aaaa) y velocidad de internet en la barra de estado, alrededor del reloj. Se ve en todas las apps.</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Activado</string>
+          			<key>key</key>
+          			<string>Enabled</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Mostrar fecha</string>
+          			<key>key</key>
+          			<string>ShowDate</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Mostrar velocidad</string>
+          			<key>key</key>
+          			<string>ShowSpeed</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Mostrar subida (ademas de bajada)</string>
+          			<key>key</key>
+          			<string>ShowUpload</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>Tamano</string>
+          			<key>footerText</key>
+          			<string>La rueda ajusta el tamano del texto (fecha y velocidad) para que quepa todo.</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSliderCell</string>
+          			<key>key</key>
+          			<string>FontSize</string>
+          			<key>default</key>
+          			<real>9</real>
+          			<key>min</key>
+          			<real>6</real>
+          			<key>max</key>
+          			<real>14</real>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>Separacion (hueco del reloj)</string>
+          			<key>footerText</key>
+          			<string>Separa la fecha (arriba) de la velocidad (abajo) para dejar el reloj del sistema en medio. Sube la separacion y coloca el bloque sobre el reloj con el ajuste X.</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSliderCell</string>
+          			<key>key</key>
+          			<string>Gap</string>
+          			<key>default</key>
+          			<real>18</real>
+          			<key>min</key>
+          			<real>0</real>
+          			<key>max</key>
+          			<real>40</real>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>Posicion</string>
+          			<key>footerText</key>
+          			<string>En iPhone con isla, el centro queda tapado: usa Izquierda (zona del reloj) o Derecha, y afina con Ajuste X / Ajuste Y.</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSegmentCell</string>
+          			<key>label</key>
+          			<string>Alineacion</string>
+          			<key>key</key>
+          			<string>Alignment</string>
+          			<key>default</key>
+          			<integer>0</integer>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          			<key>validValues</key>
+          			<array>
+          				<integer>0</integer>
+          				<integer>1</integer>
+          				<integer>2</integer>
+          			</array>
+          			<key>validTitles</key>
+          			<array>
+          				<string>Izquierda</string>
+          				<string>Centro</string>
+          				<string>Derecha</string>
+          			</array>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSEditTextCell</string>
+          			<key>label</key>
+          			<string>Ajuste X</string>
+          			<key>key</key>
+          			<string>OffsetX</string>
+          			<key>default</key>
+          			<integer>0</integer>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          			<key>keyboardType</key>
+          			<string>NumbersAndPunctuation</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSEditTextCell</string>
+          			<key>label</key>
+          			<string>Ajuste Y</string>
+          			<key>key</key>
+          			<string>OffsetY</string>
+          			<key>default</key>
+          			<integer>0</integer>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          			<key>keyboardType</key>
+          			<string>NumbersAndPunctuation</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>Color</string>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSegmentCell</string>
+          			<key>label</key>
+          			<string>Color del texto</string>
+          			<key>key</key>
+          			<string>Color</string>
+          			<key>default</key>
+          			<integer>0</integer>
+          			<key>defaults</key>
+          			<string>com.juana.datespeedbar</string>
+          			<key>PostNotification</key>
+          			<string>com.juana.datespeedbar/preferencesChanged</string>
+          			<key>validValues</key>
+          			<array>
+          				<integer>0</integer>
+          				<integer>1</integer>
+          				<integer>2</integer>
+          			</array>
+          			<key>validTitles</key>
+          			<array>
+          				<string>Blanco</string>
+          				<string>Negro</string>
+          				<string>Naranja</string>
+          			</array>
+          		</dict>
+
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>footerText</key>
+          			<string>Los cambios se aplican al instante. La velocidad se pausa con la pantalla apagada para ahorrar bateria.</string>
+          		</dict>
+
+          	</array>
+          </dict>
+          </plist>
+          ZEOF_ROOT
+          mkdir -p layout/Library/PreferenceLoader/Preferences
+          cat > layout/Library/PreferenceLoader/Preferences/DateSpeedBar.plist << 'ZEOF_ENT'
+          {
+              entry = {
+                  bundle = DSBPrefs;
+                  cell = PSLinkCell;
+                  detail = DSBPrefsRootListController;
+                  isController = 1;
+                  label = "DateSpeedBar";
+              };
+          }
+          ZEOF_ENT
+
+      - name: Compilar el paquete
+        run: |
+          make clean || true
+          make package FINALPACKAGE=1 TARGET=iphone:clang:16.5:15.0
+
+      - name: Verificar que lleva todo
+        run: |
+          echo "Paquete generado:"
+          ls -la packages/*.deb
+          grep -q "FontSize" dsbprefs/Resources/Root.plist && echo "OK: rueda de tamano incluida" || (echo "FALTA la rueda" && exit 1)
+
+      - name: Subir el .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: DateSpeedBar-deb
+          path: packages/*.deb
+          if-no-files-found: error
