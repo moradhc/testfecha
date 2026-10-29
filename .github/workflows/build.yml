@@ -53,7 +53,7 @@ jobs:
           cat > control << 'ZEOF_CTL'
           Package: com.juana.datespeedbar
           Name: DateSpeedBar
-          Version: 1.1.0
+          Version: 1.1.1
           Architecture: iphoneos-arm64
           Description: Fecha (dd/mm/aaaa) y velocidad de internet en la barra de estado, alrededor del reloj. Solo SpringBoard, en todas las apps.
           Maintainer: Juana
@@ -525,7 +525,20 @@ jobs:
           static int      gStyleToken = -1;
           static long long gLastReported = -999;
 
+          // Publica un estilo (1 = blanco, 3 = negro). SpringBoard no publica: solo escucha.
+          static void postStyle(long long style) {
+              if (gIsSpringBoard) return;
+              if (style == gLastReported) return;
+              gLastReported = style;
+              if (gStyleToken != -1) {
+                  notify_set_state(gStyleToken, (uint64_t)style);
+                  notify_post(kBarStyle);
+              }
+          }
+
+          // Reporta el estilo actual de ESTA app (en primer plano).
           static void reportStyle(void) {
+              if (gIsSpringBoard) return;
               @try {
                   UIApplication *app = [UIApplication sharedApplication];
                   if (!app) return;
@@ -542,30 +555,34 @@ jobs:
                       @try { ui = UITraitCollection.currentTraitCollection.userInterfaceStyle; } @catch (__unused id e) {}
                       style = (ui == UIUserInterfaceStyleDark) ? 1 : 3;  // blanco : negro
                   }
-                  if (style == gLastReported) return;
-                  gLastReported = style;
-                  if (gStyleToken != -1) {
-                      notify_set_state(gStyleToken, (uint64_t)style);
-                      notify_post(kBarStyle);
-                  }
+                  if (style != 1 && style != 3) style = 1;
+                  postStyle(style);
               } @catch (__unused id e) {}
           }
+
+          // Al salir de la app, lo que viene (inicio / multitarea / bloqueo) es blanco.
+          static void reportWhite(void) { postStyle(1); }
 
           %hook UIViewController
           - (void)setNeedsStatusBarAppearanceUpdate {
               %orig;
+              if (gIsSpringBoard) return;   // SpringBoard no reporta; evita pisar el color de las apps
               dispatch_async(dispatch_get_main_queue(), ^{ reportStyle(); });
           }
           %end
 
           static void setupStyleObserver(void) {
-              // Token para publicar el estado del estilo.
               notify_register_check(kBarStyle, &gStyleToken);
-              // Reportar al activarse la app y periodicamente por si algun caso se escapa.
-              [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                  object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
-                      reportStyle();
-                  }];
+              if (gIsSpringBoard) return;   // SpringBoard solo ESCUCHA (en su bloque del ctor)
+
+              NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+              [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+                               queue:[NSOperationQueue mainQueue]
+                          usingBlock:^(NSNotification *n) { reportStyle(); }];
+              [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil
+                               queue:[NSOperationQueue mainQueue]
+                          usingBlock:^(NSNotification *n) { reportWhite(); }];
+              // Valor inicial al arrancar dentro de una app.
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                              dispatch_get_main_queue(), ^{ reportStyle(); });
           }
