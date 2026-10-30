@@ -53,7 +53,7 @@ jobs:
           cat > control << 'ZEOF_CTL'
           Package: com.juana.datespeedbar
           Name: DateSpeedBar
-          Version: 1.1.2
+          Version: 1.1.3
           Architecture: iphoneos-arm64
           Description: Fecha (dd/mm/aaaa) y velocidad de internet en la barra de estado, alrededor del reloj. Solo SpringBoard, en todas las apps.
           Maintainer: Juana
@@ -312,16 +312,28 @@ jobs:
           }
 
           static NSString *shortSpeed(double bytesPerSec) {
+              double gb = bytesPerSec / 1073741824.0;
               double mb = bytesPerSec / 1048576.0;
               double kb = bytesPerSec / 1024.0;
+              if (gb >= 1.0) return [NSString stringWithFormat:@"%.1fG", gb];
               if (mb >= 1.0) return [NSString stringWithFormat:@"%.1fM", mb];
               return [NSString stringWithFormat:@"%.0fK", kb];
           }
 
+          // Rellena por la izquierda hasta un ancho fijo (con fuente monoespaciada el
+          // resultado ocupa siempre lo mismo, asi nada se mueve al cambiar la velocidad).
+          static NSString *padL(NSString *s, NSUInteger w) {
+              NSMutableString *m = [s mutableCopy];
+              while (m.length < w) [m insertString:@" " atIndex:0];
+              return m;
+          }
+
           static NSString *speedString(double down, double up) {
-              if (gShowUpload)
-                  return [NSString stringWithFormat:@"↓%@ ↑%@", shortSpeed(down), shortSpeed(up)];
-              return [NSString stringWithFormat:@"↓%@", shortSpeed(down)];
+              NSString *d = padL(shortSpeed(down), 6);
+              if (!gShowUpload) return [NSString stringWithFormat:@"↓%@", d];
+              NSString *u = padL(shortSpeed(up), 6);
+              // Doble espacio = hueco fijo entre descarga (↓) y subida (↑).
+              return [NSString stringWithFormat:@"↓%@  ↑%@", d, u];
           }
 
           #pragma mark - Escena activa
@@ -341,7 +353,9 @@ jobs:
 
           // Coloca las dos etiquetas dentro de 'container' y devuelve el tamano total.
           static CGSize layoutBlock(UIView *container, UILabel *dateL, UILabel *speedL) {
-              UIFont *font = [UIFont monospacedDigitSystemFontOfSize:gFontSize weight:UIFontWeightSemibold];
+              // Monoespaciada COMPLETA: cada caracter (incluido el espacio) ocupa lo mismo,
+              // asi el ancho es constante y la fecha no se mueve al cambiar la velocidad.
+              UIFont *font = [UIFont monospacedSystemFontOfSize:gFontSize weight:UIFontWeightSemibold];
               dateL.font = font;  speedL.font = font;
               dateL.textColor = textColor();  speedL.textColor = textColor();
 
