@@ -53,7 +53,7 @@ jobs:
           cat > control << 'ZEOF_CTL'
           Package: com.juana.datespeedbar
           Name: DateSpeedBar
-          Version: 1.1.1
+          Version: 1.1.2
           Architecture: iphoneos-arm64
           Description: Fecha (dd/mm/aaaa) y velocidad de internet en la barra de estado, alrededor del reloj. Solo SpringBoard, en todas las apps.
           Maintainer: Juana
@@ -524,8 +524,75 @@ jobs:
           // SpringBoard pinte la fecha/velocidad del mismo color que el reloj.
           static int      gStyleToken = -1;
           static long long gLastReported = -999;
+          static BOOL     gResigned = NO;   // app en segundo plano: no re-reportar su color
 
-          // Publica un estilo (1 = blanco, 3 = negro). SpringBoard no publica: solo escucha.
+          @interface UIStatusBarManager (DSB)
+          - (NSInteger)statusBarStyle;   // privado: estilo YA resuelto (1 light / 3 dark)
+          @end
+
+          static UIWindowScene *fgScene(void) {
+              UIWindowScene *fb = nil;
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if (![s isKindOfClass:UIWindowScene.class]) continue;
+                  UIWindowScene *ws = (UIWindowScene *)s;
+                  if (ws.activationState == UISceneActivationStateForegroundActive) return ws;
+                  if (!fb) fb = ws;
+              }
+              return fb;
+          }
+
+          // Recorre la cadena de view controllers que decide el estilo de la barra y
+          // devuelve su preferredStatusBarStyle (0 default, 1 light/blanco, 3 dark/negro).
+          static long long vcStyle(UIViewController *root) {
+              UIViewController *vc = root;
+              int guard = 0;
+              while (vc && guard++ < 30) {
+                  UIViewController *next = nil;
+                  @try { next = [vc childViewControllerForStatusBarStyle]; } @catch (__unused id e) {}
+                  if (!next) {
+                      @try {
+                          UIViewController *pres = vc.presentedViewController;
+                          if (pres && pres.modalPresentationCapturesStatusBarAppearance) next = pres;
+                      } @catch (__unused id e) {}
+                  }
+                  if (!next || next == vc) break;
+                  vc = next;
+              }
+              long long s = 0;
+              @try { s = (long long)[vc preferredStatusBarStyle]; } @catch (__unused id e) { s = 0; }
+              return s;
+          }
+
+          // Devuelve 1 (texto blanco) o 3 (texto negro) para la app en primer plano.
+          static long long currentAppStyle(void) {
+              long long style = 0;
+              // 1) Via documentada: el VC que decide la barra de estado.
+              @try {
+                  UIWindowScene *scene = fgScene();
+                  UIWindow *keyW = nil;
+                  for (UIWindow *w in scene.windows) { if (w.isKeyWindow) { keyW = w; break; } }
+                  if (!keyW) keyW = scene.windows.firstObject;
+                  if (keyW.rootViewController) style = vcStyle(keyW.rootViewController);
+              } @catch (__unused id e) { style = 0; }
+              // 2) Respaldo: statusBarManager (estilo resuelto, privado).
+              if (style != 1 && style != 3) {
+                  @try {
+                      UIStatusBarManager *mgr = fgScene().statusBarManager;
+                      if (mgr && [mgr respondsToSelector:@selector(statusBarStyle)]) {
+                          long long s2 = (long long)[mgr statusBarStyle];
+                          if (s2 == 1 || s2 == 3) style = s2;
+                      }
+                  } @catch (__unused id e) {}
+              }
+              // 3) "default": resolver por claro/oscuro del sistema.
+              if (style == 0) {
+                  UIUserInterfaceStyle ui = UIUserInterfaceStyleLight;
+                  @try { ui = UITraitCollection.currentTraitCollection.userInterfaceStyle; } @catch (__unused id e) {}
+                  style = (ui == UIUserInterfaceStyleDark) ? 1 : 3;
+              }
+              return (style == 1) ? 1 : 3;   // 1 = blanco, resto = negro
+          }
+
           static void postStyle(long long style) {
               if (gIsSpringBoard) return;
               if (style == gLastReported) return;
@@ -536,37 +603,22 @@ jobs:
               }
           }
 
-          // Reporta el estilo actual de ESTA app (en primer plano).
           static void reportStyle(void) {
-              if (gIsSpringBoard) return;
-              @try {
-                  UIApplication *app = [UIApplication sharedApplication];
-                  if (!app) return;
-                  long long style = 0;
-                  @try {
-          #pragma clang diagnostic push
-          #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                      style = (long long)[app statusBarStyle];
-          #pragma clang diagnostic pop
-                  } @catch (__unused id e) { return; }
-                  // "default" (0): resolver segun claro/oscuro del sistema.
-                  if (style == 0) {
-                      UIUserInterfaceStyle ui = UIUserInterfaceStyleLight;
-                      @try { ui = UITraitCollection.currentTraitCollection.userInterfaceStyle; } @catch (__unused id e) {}
-                      style = (ui == UIUserInterfaceStyleDark) ? 1 : 3;  // blanco : negro
-                  }
-                  if (style != 1 && style != 3) style = 1;
-                  postStyle(style);
-              } @catch (__unused id e) {}
+              if (gIsSpringBoard || gResigned) return;
+              postStyle(currentAppStyle());
           }
 
-          // Al salir de la app, lo que viene (inicio / multitarea / bloqueo) es blanco.
-          static void reportWhite(void) { postStyle(1); }
+          // Al salir de la app, lo siguiente (inicio / multitarea / bloqueo) es blanco;
+          // y bloqueamos reportes hasta reentrar para que no se re-pise.
+          static void reportWhite(void) {
+              gResigned = YES;
+              postStyle(1);
+          }
 
           %hook UIViewController
           - (void)setNeedsStatusBarAppearanceUpdate {
               %orig;
-              if (gIsSpringBoard) return;   // SpringBoard no reporta; evita pisar el color de las apps
+              if (gIsSpringBoard || gResigned) return;
               dispatch_async(dispatch_get_main_queue(), ^{ reportStyle(); });
           }
           %end
@@ -578,11 +630,15 @@ jobs:
               NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
               [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
                                queue:[NSOperationQueue mainQueue]
-                          usingBlock:^(NSNotification *n) { reportStyle(); }];
+                          usingBlock:^(NSNotification *n) {
+                  gResigned = NO;
+                  // pequeno retardo: deja que la app fije su estilo definitivo al entrar.
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{ reportStyle(); });
+              }];
               [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil
                                queue:[NSOperationQueue mainQueue]
                           usingBlock:^(NSNotification *n) { reportWhite(); }];
-              // Valor inicial al arrancar dentro de una app.
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                              dispatch_get_main_queue(), ^{ reportStyle(); });
           }
